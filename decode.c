@@ -41,7 +41,8 @@
 #include <string.h>
 
 #include <cuda_runtime_api.h>
-#include <nvcuvid.h>
+//#include <nvcuvid.h>
+#include <dynlink_nvcuvid.h>
 #include <nvToolsExt.h>
 #include "config.nvp.h"
 #include "debug.h"
