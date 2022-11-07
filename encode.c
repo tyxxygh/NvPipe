@@ -83,6 +83,9 @@ struct nvp_encoder {
     uint32_t max_height; /* Max encoder height supported by HW+SDK. */
 };
 
+//forward declare
+bool on_encode_sise_changed(struct nvp_encoder* nvp, int width, int height);
+
 #define CLEAR_DL_ERRORS() { \
     const char* errmsg_ = dlerror(); \
     while(errmsg_ != NULL) { \
@@ -185,14 +188,8 @@ unregister_resource(struct nvp_encoder* nvp) {
     } \
     } while(0)
 
-/* clean up any memory associated with this instance. */
-void
-nvp_nvenc_destroy(nvpipe* const __restrict cdc) {
-    struct nvp_encoder* nvp = (struct nvp_encoder*)cdc;
-    assert(nvp->impl.type == ENCODER);
-
-    CHECK_CONTEXT(nvp->ctx, {});
-
+void nvp_reset_encode_ctx(struct nvp_encoder* nvp)
+{
     if(nvp->initialized) {
         flush_encoder(nvp, 0);
     }
@@ -225,16 +222,26 @@ nvp_nvenc_destroy(nvpipe* const __restrict cdc) {
         }
         nvp->encoder = NULL;
     }
-    if(dlclose(nvp->lib) != 0) {
-        WARN(enc, "Error closing NvCodec encode library: %s", dlerror());
-    }
-    nvp->lib = NULL;
 
     if(nvp->reorg) {
         nvp->reorg->destroy(nvp->reorg);
         nvp->reorg = NULL;
     }
+}
+/* clean up any memory associated with this instance. */
+void
+nvp_nvenc_destroy(nvpipe* const __restrict cdc) {
+    struct nvp_encoder* nvp = (struct nvp_encoder*)cdc;
+    assert(nvp->impl.type == ENCODER);
 
+    CHECK_CONTEXT(nvp->ctx, {});
+
+    nvp_reset_encode_ctx(nvp);
+    
+    if(dlclose(nvp->lib) != 0) {
+        WARN(enc, "Error closing NvCodec encode library: %s", dlerror());
+    }
+    nvp->lib = NULL;
     nvp->ctx = 0;
 }
 
@@ -624,6 +631,16 @@ nvp_nvenc_encode(nvpipe * const __restrict codec,
     uint32_t widthDevice = (width < 48) ? 48 : (width + ((width % 16) != 0 ? 16 - (width % 16) : 0));
     uint32_t heightDevice = (height < 32) ? 32 : (height + ((height % 16) != 0 ? 16 - (height % 16) : 0));
 
+    const float resetMemThrd = 0.8f;
+    if(widthDevice > nvp->width || heightDevice > nvp->height ||
+        widthDevice < nvp->width * resetMemThrd || heightDevice < nvp->height * resetMemThrd)
+    {
+        if(!on_encode_sise_changed(nvp, widthDevice, heightDevice))
+        {
+            return NVPIPE_EINVAL;
+        }
+    }
+
     nvp_err_t errcode = NVPIPE_SUCCESS;
     if(!nvp->initialized) {
         if(!enc_initialize(nvp, widthDevice, heightDevice)) {
@@ -890,6 +907,7 @@ nvp_create_encoder(uint64_t bitrate) {
     params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
     params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
     const NVENCSTATUS opn = nvp->f.nvEncOpenEncodeSessionEx(&params, &nvp->encoder);
+
     if(opn != NV_ENC_SUCCESS) {
         ERR(enc, "Error %d creating encode session: %s", opn, nvcodec_strerror(opn));
         dlclose(nvp->lib);
@@ -909,4 +927,51 @@ nvp_create_encoder(uint64_t bitrate) {
     // We can't initialize until we know resolution, which only comes on encode.
     nvp->initialized = false;
     return (nvp_impl_t*)nvp;
+}
+
+bool on_encode_sise_changed(struct nvp_encoder* nvp, int width, int height)
+{
+    //first close session and then reopen again.
+    nvp_reset_encode_ctx(nvp);
+
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS params = {0};
+    /* We have a desire/need to support NvEnc 5.x.  Most people would just want
+     * to support whatever version they compiled against, though; in that case,
+     * you should use NVENCAPI_VERSION. */
+    params.apiVersion = (5 << 4) | 0;
+    params.device = nvp->ctx;
+    params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+    params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+    const NVENCSTATUS opn = nvp->f.nvEncOpenEncodeSessionEx(&params, &nvp->encoder);
+
+    if(opn != NV_ENC_SUCCESS) {
+        ERR(enc, "Error %d creating encode session: %s", opn, nvcodec_strerror(opn));
+        dlclose(nvp->lib);
+        free(nvp);
+        return false;
+    }
+
+    assert(nvp->encoder);
+
+    nvp_err_t qry = query_max_dimensions(nvp);
+    if(NVPIPE_SUCCESS != qry) {
+        ERR(enc, "Error %d querying dimensions: %s", qry, nvpipe_strerror(qry));
+        dlclose(nvp->lib);
+        free(nvp);
+        return false;
+    }
+
+    if(width > nvp->max_width || height > nvp->max_height)
+    {
+        ERR(enc, "Error: new dimensions (%d x %d)exceed max cap: (%d x %d)",
+            width, height, nvp->max_width, nvp->max_height);
+        return false;
+    }
+
+    //override max_width and max_height to save memory.
+    nvp->max_width = width;
+    nvp->max_height = height;
+
+    nvp->initialized = false;
+    return true;
 }
